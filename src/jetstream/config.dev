@@ -12,7 +12,7 @@ SKIP_SSL_VALIDATION=true
 CONSOLE_PROXY_TLS_ADDRESS=:5443
 CONSOLE_CLIENT=console
 CF_CLIENT=cf
-UAA_ENDPOINT=
+UAA_ENDPOINT=http://localhost:8080
 CONSOLE_ADMIN_SCOPE=stratos.admin
 CF_ADMIN_ROLE=cloud_controller.admin
 ALLOWED_ORIGINS=http://nginx
@@ -52,10 +52,14 @@ INVITE_USER_CLIENT_ID=
 INVITE_USER_CLIENT_SECRET=
 
 # Use local admin user rather than UAA users
-AUTH_ENDPOINT_TYPE=local
+AUTH_ENDPOINT_TYPE=remote
 LOCAL_USER=admin
 LOCAL_USER_PASSWORD=admin
 LOCAL_USER_SCOPE=stratos.admin
+
+# Enable users create user endpoints (disabled, admin_only, enabled). Default is disabled
+# admin_only will enable admins to see created user endpoints, but users won't be able to create user endpoints or see them
+USER_ENDPOINTS_ENABLED=disabled
 
 # Enable/disable API key-based access to Stratos API (disabled, admin_only, all_users). Default is admin_only
 #API_KEYS_ENABLED=admin_only

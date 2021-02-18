@@ -12,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/cloudfoundry-incubator/stratos/src/jetstream/repository/interfaces"
+	"github.com/cloudfoundry-incubator/stratos/src/jetstream/repository/interfaces/config"
 	"github.com/cloudfoundry-incubator/stratos/src/jetstream/repository/tokens"
 )
 
@@ -149,14 +150,26 @@ func (p *portalProxy) DoLoginToCNSI(c echo.Context, cnsiGUID string, systemShare
 		return nil, echo.NewHTTPError(http.StatusUnauthorized, "Could not find correct session value")
 	}
 
-	// Register as a system endpoint?
-	if systemSharedToken {
-		// User needs to be an admin
+	// admins are note allowed to connect to user created endpoints
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled && len(cnsiRecord.Creator) != 0 {
 		user, err := p.StratosAuthService.GetUser(userID)
 		if err != nil {
-			return nil, echo.NewHTTPError(http.StatusUnauthorized, "Can not connect System Shared endpoint - could not check user")
+			return nil, echo.NewHTTPError(http.StatusUnauthorized, "Can not connect - could not check user")
 		}
 
+		if user.Admin {
+			return nil, echo.NewHTTPError(http.StatusUnauthorized, "Can not connect - admins are not allowed to connect to user created endpoints")
+		}
+	}
+
+	// Register as a system endpoint?
+	if systemSharedToken {
+		user, err := p.StratosAuthService.GetUser(userID)
+		if err != nil {
+			return nil, echo.NewHTTPError(http.StatusUnauthorized, "Can not connect - could not check user")
+		}
+
+		// User needs to be an admin
 		if !user.Admin {
 			return nil, echo.NewHTTPError(http.StatusUnauthorized, "Can not connect System Shared endpoint - user is not an administrator")
 		}

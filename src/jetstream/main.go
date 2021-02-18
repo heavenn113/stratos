@@ -693,6 +693,12 @@ func newPortalProxy(pc interfaces.PortalConfig, dcp *sql.DB, ss HttpSessionStore
 		pc.APIKeysEnabled = config.APIKeysConfigEnum.AdminOnly
 	}
 
+	// Setting default value for UserEndpointsEnabled
+	if pc.UserEndpointsEnabled == "" {
+		log.Debug(`UserEndpointsEnabled not set, setting to "disabled"`)
+		pc.UserEndpointsEnabled = config.UserEndpointsConfigEnum.Disabled
+	}
+
 	pp := &portalProxy{
 		Config:                 pc,
 		DatabaseConnectionPool: dcp,
@@ -1112,10 +1118,19 @@ func (p *portalProxy) registerRoutes(e *echo.Echo, needSetupMiddleware bool) {
 
 	// API endpoints with Swagger documentation and accessible with an API key that require admin permissions
 	stableAdminAPIGroup := stableAPIGroup
-	stableAdminAPIGroup.Use(p.adminMiddleware)
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled {
+		stableAdminAPIGroup.Use(p.endpointAdminMiddleware)
+	} else {
+		stableAdminAPIGroup.Use(p.adminMiddleware)
+	}
 
 	// route endpoint creation requests to respecive plugins
 	stableAdminAPIGroup.POST("/endpoints", p.pluginRegisterRouter)
+
+	// do additional checks if user endpoints are enabled
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled {
+		stableAdminAPIGroup.Use(p.endpointUpdateDeleteMiddleware)
+	}
 
 	// Apply edits for the given endpoint
 	stableAdminAPIGroup.POST("/endpoints/:id", p.updateEndpoint)

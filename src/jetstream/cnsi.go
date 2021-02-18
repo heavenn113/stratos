@@ -17,6 +17,7 @@ import (
 
 	"github.com/cloudfoundry-incubator/stratos/src/jetstream/plugins/userfavorites/userfavoritesendpoints"
 	"github.com/cloudfoundry-incubator/stratos/src/jetstream/repository/interfaces"
+	"github.com/cloudfoundry-incubator/stratos/src/jetstream/repository/interfaces/config"
 )
 
 const dbReferenceError = "Unable to establish a database reference: '%v'"
@@ -62,12 +63,27 @@ func (p *portalProxy) RegisterEndpoint(c echo.Context, fetchInfo interfaces.Info
 	cnsiClientSecret := params.CNSIClientSecret
 	subType := params.SubType
 
+	overwriteEndpoints, err := strconv.ParseBool(params.OverwriteEndpoints)
+	if err != nil {
+		// default to false
+		overwriteEndpoints = false
+	}
+
 	if cnsiClientId == "" {
 		cnsiClientId = p.GetConfig().CFClient
 		cnsiClientSecret = p.GetConfig().CFClientSecret
 	}
 
-	newCNSI, err := p.DoRegisterEndpoint(params.CNSIName, params.APIEndpoint, skipSSLValidation, cnsiClientId, cnsiClientSecret, ssoAllowed, subType, fetchInfo)
+	sessionValue, err := p.GetSessionValue(c, "user_id")
+	if err != nil {
+		return interfaces.NewHTTPShadowError(
+			http.StatusInternalServerError,
+			"Failed to get session user",
+			"Failed to get session user: %v", err)
+	}
+	uaaUserId := sessionValue.(string)
+
+	newCNSI, err := p.DoRegisterEndpoint(params.CNSIName, params.APIEndpoint, skipSSLValidation, cnsiClientId, cnsiClientSecret, uaaUserId, ssoAllowed, subType, overwriteEndpoints, fetchInfo)
 	if err != nil {
 		return err
 	}
@@ -76,7 +92,8 @@ func (p *portalProxy) RegisterEndpoint(c echo.Context, fetchInfo interfaces.Info
 	return nil
 }
 
-func (p *portalProxy) DoRegisterEndpoint(cnsiName string, apiEndpoint string, skipSSLValidation bool, clientId string, clientSecret string, ssoAllowed bool, subType string, fetchInfo interfaces.InfoFunc) (interfaces.CNSIRecord, error) {
+func (p *portalProxy) DoRegisterEndpoint(cnsiName string, apiEndpoint string, skipSSLValidation bool, clientId string, clientSecret string, userId string, ssoAllowed bool, subType string, overwriteEndpoints bool, fetchInfo interfaces.InfoFunc) (interfaces.CNSIRecord, error) {
+	log.Debug("DoRegisterEndpoint")
 
 	if len(cnsiName) == 0 || len(apiEndpoint) == 0 {
 		return interfaces.CNSIRecord{}, interfaces.NewHTTPShadowError(
@@ -96,8 +113,22 @@ func (p *portalProxy) DoRegisterEndpoint(cnsiName string, apiEndpoint string, sk
 			"Failed to get API Endpoint: %v", err)
 	}
 
+	isAdmin := true
+
+	// anonymous admin?
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled && len(userId) != 0 {
+		currentCreator, err := p.StratosAuthService.GetUser(userId)
+		if err != nil {
+			return interfaces.CNSIRecord{}, interfaces.NewHTTPShadowError(
+				http.StatusInternalServerError,
+				"Failed to get user information",
+				"Failed to get user information: %v", err)
+		}
+		isAdmin = currentCreator.Admin
+	}
+
 	// check if we've already got this endpoint in the DB
-	ok := p.cnsiRecordExists(apiEndpoint)
+	ok := p.adminCNSIRecordExists(apiEndpoint)
 	if ok {
 		// a record with the same api endpoint was found
 		return interfaces.CNSIRecord{}, interfaces.NewHTTPShadowError(
@@ -106,6 +137,52 @@ func (p *portalProxy) DoRegisterEndpoint(cnsiName string, apiEndpoint string, sk
 			"Can not register same endpoint multiple times",
 		)
 	}
+
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled {
+		// get all endpoints determined by the APIEndpoint
+		duplicateEndpoints, err := p.listCNSIByAPIEndpoint(apiEndpoint)
+		if err != nil {
+			return interfaces.CNSIRecord{}, interfaces.NewHTTPShadowError(
+				http.StatusBadRequest,
+				"Failed to check other endpoints",
+				"Failed to check other endpoints: %v",
+				err)
+		}
+
+		// check if we've already got this APIEndpoint in this DB
+		for _, duplicate := range duplicateEndpoints {
+			if len(duplicate.Creator) == 0 {
+				return interfaces.CNSIRecord{}, interfaces.NewHTTPShadowError(
+					http.StatusBadRequest,
+					"Can not register same admin endpoint multiple times",
+					"Can not register same admin endpoint multiple times",
+				)
+			}
+			if duplicate.Creator == userId && !overwriteEndpoints {
+				return interfaces.CNSIRecord{}, interfaces.NewHTTPShadowError(
+					http.StatusBadRequest,
+					"Can not register same endpoint multiple times",
+					"Can not register same endpoint multiple times",
+				)
+			}
+		}
+
+		if isAdmin {
+			// remove all endpoints with same APIEndpoint
+			for _, duplicate := range duplicateEndpoints {
+				p.doUnregisterCluster(duplicate.GUID)
+			}
+		}
+	}
+
+	h := sha1.New()
+	// see why its generated this way in Issue #4753 / #3031
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled && !isAdmin {
+		h.Write([]byte(apiEndpointURL.String() + userId))
+	} else {
+		h.Write([]byte(apiEndpointURL.String()))
+	}
+	guid := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 
 	newCNSI, _, err := fetchInfo(apiEndpoint, skipSSLValidation)
 	if err != nil {
@@ -123,10 +200,6 @@ func (p *portalProxy) DoRegisterEndpoint(cnsiName string, apiEndpoint string, sk
 			err)
 	}
 
-	h := sha1.New()
-	h.Write([]byte(apiEndpointURL.String()))
-	guid := base64.RawURLEncoding.EncodeToString(h.Sum(nil))
-
 	newCNSI.Name = cnsiName
 	newCNSI.APIEndpoint = apiEndpointURL
 	newCNSI.SkipSSLValidation = skipSSLValidation
@@ -134,6 +207,11 @@ func (p *portalProxy) DoRegisterEndpoint(cnsiName string, apiEndpoint string, sk
 	newCNSI.ClientSecret = clientSecret
 	newCNSI.SSOAllowed = ssoAllowed
 	newCNSI.SubType = subType
+
+	// admins currently can't create user endpoints
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled && !isAdmin {
+		newCNSI.Creator = userId
+	}
 
 	err = p.setCNSIRecord(guid, newCNSI)
 
@@ -173,6 +251,13 @@ func (p *portalProxy) unregisterCluster(c echo.Context) error {
 			"Missing target endpoint",
 			"Need CNSI GUID passed as form param")
 	}
+
+	return p.doUnregisterCluster(cnsiGUID)
+}
+
+func (p *portalProxy) doUnregisterCluster(cnsiGUID string) error {
+	log.Debug("doUnregisterCluster")
+
 	// Should check for errors?
 	p.unsetCNSIRecord(cnsiGUID)
 
@@ -186,7 +271,27 @@ func (p *portalProxy) unregisterCluster(c echo.Context) error {
 
 func (p *portalProxy) buildCNSIList(c echo.Context) ([]*interfaces.CNSIRecord, error) {
 	log.Debug("buildCNSIList")
-	return p.ListEndpoints()
+
+	if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.Disabled {
+		userID, err := p.GetSessionValue(c, "user_id")
+		if err != nil {
+			return nil, err
+		}
+
+		u, err := p.StratosAuthService.GetUser(userID.(string))
+		if err != nil {
+			return nil, err
+		}
+
+		if u.Admin {
+			return p.ListEndpoints()
+		}
+
+		if p.GetConfig().UserEndpointsEnabled != config.UserEndpointsConfigEnum.AdminOnly {
+			return p.ListAdminEndpoints(userID.(string))
+		}
+	}
+	return p.ListAdminEndpoints("")
 }
 
 func (p *portalProxy) ListEndpoints() ([]*interfaces.CNSIRecord, error) {
@@ -200,6 +305,61 @@ func (p *portalProxy) ListEndpoints() ([]*interfaces.CNSIRecord, error) {
 	}
 
 	cnsiList, err = cnsiRepo.List(p.Config.EncryptionKeyInBytes)
+	if err != nil {
+		return cnsiList, err
+	}
+
+	return cnsiList, nil
+}
+
+//return a CNSI list with endpoints created by the current endpointadmin and all admins
+func (p *portalProxy) ListAdminEndpoints(userID string) ([]*interfaces.CNSIRecord, error) {
+	log.Debug("ListAdminEndpoints")
+
+	var cnsiList []*interfaces.CNSIRecord
+	var userList []string
+	var err error
+
+	userList = append(userList, userID)
+	if len(userID) != 0 {
+		userList = append(userList, "")
+	}
+
+	//get a cnsi list from every admin found and given userID
+	cnsiRepo, err := p.GetStoreFactory().EndpointStore()
+	if err != nil {
+		return cnsiList, fmt.Errorf("listRegisteredCNSIs: %s", err)
+	}
+
+	for _, id := range userList {
+		creatorList, err := cnsiRepo.ListByCreator(id, p.Config.EncryptionKeyInBytes)
+		if err != nil {
+			return creatorList, err
+		}
+		cnsiList = append(cnsiList, creatorList...)
+	}
+	return cnsiList, nil
+}
+
+// listCNSIByAPIEndpoint - receives a URL as string (must be formatted like it's saved)
+func (p *portalProxy) listCNSIByAPIEndpoint(apiEndpoint string) ([]*interfaces.CNSIRecord, error) {
+	log.Debug("listCNSIByAPIEndpoint")
+
+	var cnsiList []*interfaces.CNSIRecord
+	var err error
+
+	// Remove trailing slash, if there is one
+	apiEndpointURL, err := url.Parse(apiEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to get API Endpoint: %s", err)
+	}
+
+	cnsiRepo, err := p.GetStoreFactory().EndpointStore()
+	if err != nil {
+		return cnsiList, fmt.Errorf("listCNSIByAPIEndpoint: %s", err)
+	}
+
+	cnsiList, err = cnsiRepo.ListByAPIEndpoint(fmt.Sprintf("%s", apiEndpointURL), p.Config.EncryptionKeyInBytes)
 	if err != nil {
 		return cnsiList, err
 	}
@@ -340,30 +500,36 @@ func (p *portalProxy) GetCNSIRecord(guid string) (interfaces.CNSIRecord, error) 
 	return rec, nil
 }
 
-func (p *portalProxy) GetCNSIRecordByEndpoint(endpoint string) (interfaces.CNSIRecord, error) {
-	log.Debug("GetCNSIRecordByEndpoint")
-	var rec interfaces.CNSIRecord
+func (p *portalProxy) GetAdminCNSIRecordByEndpoint(endpoint string) (interfaces.CNSIRecord, error) {
+	log.Debug("GetAdminCNSIRecordByEndpoint")
+	var rec *interfaces.CNSIRecord
 
-	cnsiRepo, err := p.GetStoreFactory().EndpointStore()
+	endpointList, err := p.listCNSIByAPIEndpoint(endpoint)
 	if err != nil {
-		return rec, err
+		return interfaces.CNSIRecord{}, err
 	}
 
-	rec, err = cnsiRepo.FindByAPIEndpoint(endpoint, p.Config.EncryptionKeyInBytes)
-	if err != nil {
-		return rec, err
+	// search for endpoint created by an admin
+	for _, endpoint := range endpointList {
+		if len(endpoint.Creator) == 0 {
+			rec = endpoint
+		}
+	}
+
+	if rec == nil {
+		return interfaces.CNSIRecord{}, fmt.Errorf("Can not find admin CNSIRecord by given endpoint")
 	}
 
 	// Ensure that trailing slash is removed from the API Endpoint
 	rec.APIEndpoint.Path = strings.TrimRight(rec.APIEndpoint.Path, "/")
 
-	return rec, nil
+	return *rec, nil
 }
 
-func (p *portalProxy) cnsiRecordExists(endpoint string) bool {
-	log.Debug("cnsiRecordExists")
+func (p *portalProxy) adminCNSIRecordExists(apiEndpoint string) bool {
+	log.Debug("adminCNSIRecordExists")
 
-	_, err := p.GetCNSIRecordByEndpoint(endpoint)
+	_, err := p.GetAdminCNSIRecordByEndpoint(apiEndpoint)
 	return err == nil
 }
 
